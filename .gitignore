@@ -1,0 +1,6 @@
+.clj-kondo/
+.shadow-cljs/
+.lsp
+result
+target
+dev
