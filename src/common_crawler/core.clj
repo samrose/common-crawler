@@ -14,15 +14,14 @@
 (def job-keywords #{"job" "career" "position" "vacancy" "employment" "hiring" "open positions"
                     "we're hiring" "join our team" "work with us" "apply now"
                     "full-time" "full time" "part-time" "part time" "remote"})
-(def job-sites {"ziprecruiter" "https://www.ziprecruiter.com/jobs-search*"
-                "supabase" "https://supabase.com/careers*"
+(def job-sites {"supabase" "https://supabase.com/careers*"
                 "supabase-positions" "https://supabase.com/careers#open-positions*"})
 
 (def job-patterns
   {:titles #"(?i)(?:Senior|Staff|Lead|Principal|Chief|Head of|Director|Manager|Engineer|Developer|Architect|CISO|Support|Product|Design|Marketing|Sales|Accountant|Executive|Solution Architect)"
-   :locations #"(?i)(?:Remote|EMEA|Americas|APAC|US|EU|ANZ|Worldwide|Global)(?:\s+(?:time\s*zones?)?)?"
-   :departments #"(?i)(?:Engineering|Growth|Operations|Security|Marketing|Sales|Support|Product|Design|Finance|Legal|HR)"
-   :job-section-markers #"(?i)(?:Open\s+Positions?|Current\s+Openings?|Career\s+Opportunities?|Jobs?|We're\s+Hiring|Join\s+Our\s+Team)"})
+   :locations #"(?i)(?:Remote|EMEA|Americas|APAC|US|EU|ANZ|Worldwide|Global|United States)(?:\s+(?:time\s*zones?)?)?|(?:[A-Z][a-zA-Z\s]+,\s*[A-Z]{2})|(?:Work From Home)"
+   :departments #"(?i)(?:Engineering|Growth|Operations|Security|Marketing|Sales|Support|Product|Design|Finance|Legal|HR|Technology|Development)"
+   :job-section-markers #"(?i)(?:Open\s+Positions?|Current\s+Openings?|Career\s+Opportunities?|Jobs?|We're\s+Hiring|Join\s+Our\s+Team|Job\s+Details|Apply Now|Quick Apply|Easy Apply)"})
 
 (defn get-warc-record [warc-path offset length]
   ;;"Fetches and processes a WARC record using JWAT-WARC"
@@ -88,42 +87,72 @@
       (str/replace #"\s+" " ")      ;; Normalize whitespace
       (str/trim)))
 
+(defn extract-json-from-script [content]
+  "Extracts JSON data from script tags in HTML content"
+  (when-let [script-content (second (re-find #"<script id=\"js_variables\" type=\"application/json\"[^>]*>(.*?)</script>" content))]
+    (try 
+      (json/read-str script-content :key-fn keyword)
+      (catch Exception e
+        (println "Error parsing JSON from script:" (.getMessage e))
+        nil))))
+
 (defn extract-job-listings [content]
-  (let [decoded-content (decode-html-entities content)
-        parsed (html/html-snippet decoded-content)
-        ;; Try different common selectors for job sections
-        job-sections (html/select parsed [#{:div.careers-section :div.jobs-section :div.openings :section.careers :div#careers}])
-        ;; Try different common selectors for job cards
-        job-cards (html/select parsed [#{:div.job-card :div.position :div.opening :div.job-listing :article.job}])
-        ;; If no structured content found, try parsing the whole content
-        text-content (if (or (seq job-sections) (seq job-cards))
-                      (->> (concat job-sections job-cards)
-                           (mapcat html/texts)
-                           (str/join "\n"))
-                      (clean-html-content decoded-content))]
-    (->> (str/split text-content #"(?<=\.)(?=\s)|(?<=\n)")  ;; Split on sentences and newlines
-         (map str/trim)
-         (remove str/blank?)
-         ;; Look for sections that match job patterns
-         (filter (fn [text]
-                  (or 
-                   ;; Match job titles with locations
-                   (and (re-find (:titles job-patterns) text)
-                        (re-find (:locations job-patterns) text))
-                   ;; Match department headers
-                   (re-find (:departments job-patterns) text)
-                   ;; Match job requirements
-                   (and (re-find #"(?i)years?.experience" text)
-                        (re-find (:titles job-patterns) text)))))
-         (map #(str/replace % #"\s+" " "))
-         distinct)))
+  (if-let [json-data (extract-json-from-script content)]
+    ;; Handle ZipRecruiter's JSON format
+    (when-let [jobs (:jobList json-data)]
+      (->> jobs
+           (map (fn [job]
+                  (str/join " - " 
+                           (remove nil? 
+                                  [(get job :Title)
+                                   (get job :City)
+                                   (get job :FormattedSalary)
+                                   (get job :EmploymentType)]))))
+           (filter some?)))
+    ;; Fall back to HTML parsing for other sites
+    (let [decoded-content (decode-html-entities content)
+          parsed (html/html-snippet decoded-content)
+          job-sections (html/select parsed [#{:div.careers-section 
+                                            :div.jobs-section 
+                                            :div.openings 
+                                            :section.careers 
+                                            :div#careers
+                                            :div.job_content
+                                            :div.job_description
+                                            :div.job_details}])
+          job-cards (html/select parsed [#{:div.job-card 
+                                         :div.position 
+                                         :div.opening 
+                                         :div.job-listing 
+                                         :article.job
+                                         :article.job_result
+                                         :div.job_listing
+                                         :div.job_card}])
+          text-content (if (or (seq job-sections) (seq job-cards))
+                        (->> (concat job-sections job-cards)
+                             (mapcat html/texts)
+                             (str/join "\n"))
+                        (clean-html-content decoded-content))]
+      (->> (str/split text-content #"(?<=\.)(?=\s)|(?<=\n)")
+           (map str/trim)
+           (remove str/blank?)
+           (filter (fn [text]
+                    (or 
+                     (and (re-find (:titles job-patterns) text)
+                          (re-find (:locations job-patterns) text))
+                     (re-find (:departments job-patterns) text)
+                     (and (re-find #"(?i)(?:years?.experience|requirements?|qualifications?)" text)
+                          (re-find (:titles job-patterns) text))
+                     (re-find #"(?i)(?:\$\d+(?:,\d+)?(?:\s*-\s*\$\d+(?:,\d+)?)?(?:\s*(?:per|/)\s*(?:year|yr|month|mo|hour|hr|annually))|(?:salary|compensation))" text))))
+           (map #(str/replace % #"\s+" " "))
+           distinct))))
 
 (defn job-listing? [url content]
   "Determines if a page is likely a job listing"
   (or 
    ;; Check URL patterns
    (some #(.contains (str/lower-case (or url "")) %) 
-         ["career" "jobs" "position" "opening" "hire" "join" "work-with-us"])
+         ["career" "jobs" "position" "opening" "hire" "join" "work-with-us" "job-posting" "apply"])
    ;; Check content for job-related text
    (when (not-empty content)
      (or 
@@ -131,7 +160,9 @@
       (re-find (:job-section-markers job-patterns) content)
       ;; Look for combinations of job patterns
       (and (re-find (:titles job-patterns) content)
-           (re-find (:locations job-patterns) content))))))
+           (re-find (:locations job-patterns) content))
+      ;; Look for ZipRecruiter-specific patterns
+      (re-find #"(?i)(?:posted|job type|employment type|salary range|benefits|apply now)" content)))))
 
 (defn parse-html [content url]
   "Parses HTML content and extracts job listings"
@@ -143,7 +174,6 @@
            (map #(str/join " - " %))))))
 
 (defn process-cdx-response [response results-atom]
-  ;;"Processes CDX API response to extract job listings"
   (let [records (if (string? response)
                   (try 
                     (json/read-str response :key-fn keyword)
@@ -153,51 +183,36 @@
                   (if (map? response)
                     [response]
                     response))]
-    (println "Processing" (count records) "records from CDX API")
+    (println "\nProcessing" (count records) "records")
     (doseq [record records]
-      (println "\nProcessing record:" (pr-str record))
       (let [url (:url record)
             offset (Long/parseLong (str (:offset record)))
             length (Long/parseLong (str (:length record)))]
         (when url
-          (println "\nChecking URL:" url)
-          (when (job-listing? url nil)
-            (println "URL matched job site pattern:" url)
-            (if-let [warc-data (get-warc-record (:filename record) offset length)]
-              (do
-                (println "Successfully retrieved WARC data")
-                (println "WARC headers:" (pr-str (:headers warc-data)))
-                (let [content (:content warc-data)]
-                  (if content
-                    (do
-                      (println "\nGot content:")
-                      (println "----------------------------------------")
-                      ;; Print full content with line breaks for readability
-                      (println (->> (str/split content #"(?<=>)") 
-                                  (map str/trim)
-                                  (remove str/blank?)
-                                  (str/join "\n")))
-                      (println "----------------------------------------")
-                      (when (job-listing? url content)
-                        (let [job-info (parse-html content url)
-                              result {:url url :details job-info}]
-                          (when (seq job-info)
-                            (println "Found job info:" (pr-str job-info))
-                            (swap! results-atom conj result)))))
-                    (println "No content in WARC data"))))
-              (println "Failed to get WARC data"))))))))
+          (println "\nURL:" url)
+          (if-let [warc-data (get-warc-record (:filename record) offset length)]
+            (let [content (:content warc-data)]
+              (if content
+                (when (job-listing? url content)
+                  (when-let [job-info (parse-html content url)]
+                    (println "Found" (count job-info) "job listings")
+                    (swap! results-atom conj {:url url :details job-info})))
+                (println "No content in WARC data")))
+            (println "Failed to get WARC data")))))))
 
 (defn search-site [site-key site-url results-atom max-results]
   (let [query-params {"url" site-url
                      "limit" max-results
                      "filter" "!status:404"
                      "output" "json"}
-        _ (println "Querying" site-key "with params:" query-params)
+        _ (println "\n=== Searching" site-key "===")
+        _ (println "URL pattern:" site-url)
         response (http/get cdx-api-url {:query-params query-params
                                       :throw-exceptions false
-                                      :as :json})]  ;; Just get JSON response
+                                      :as :json})]
     (if (= 200 (:status response))
       (do
+        (println "Got CDX response with" (count (:body response)) "records")
         (process-cdx-response (:body response) results-atom)
         true)
       (do
@@ -227,17 +242,3 @@
     (catch Exception e
       (println "Error occurred:" (.getMessage e))
       (println "Cause:" (ex-data e)))))
-
-(defn extract-supabase-jobs [content]
-  (let [parsed (html/html-snippet content)]
-    (->> (html/select parsed [:div.careers-section :div.job-card])  ;; Updated selectors
-         (map (fn [job-div]
-                {:title (html/text (html/select job-div [:h3, :h4]))  ;; Look for both h3 and h4
-                 :department (html/text (html/select job-div [:div.department]))
-                 :location (html/text (html/select job-div [:div.location, :span.location]))  ;; Multiple location selectors
-                 :type (html/text (html/select job-div [:div.type, :span.type]))}))
-         (filter :title)
-         (map #(str (:title %) 
-                   (when (:department %) (str " - " (:department %)))
-                   (when (:location %) (str " - " (:location %)))
-                   (when (:type %) (str " - " (:type %))))))))
